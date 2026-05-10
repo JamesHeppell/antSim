@@ -1,0 +1,993 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Leaf Cutters</title>
+<link href="https://fonts.googleapis.com/css2?family=Lora:ital@0;1&display=swap" rel="stylesheet">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{width:100%;height:100%;overflow:hidden;background:#000}
+canvas{display:block;position:absolute;top:0;left:0}
+#ui{position:absolute;bottom:14px;right:18px;color:rgba(255,255,255,0.32);font:italic 12px/1 'Lora',serif;pointer-events:none;letter-spacing:.06em}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="ui"></div>
+<script>
+'use strict';
+
+// ── SEEDED PRNG (mulberry32) ─────────────────────────────────
+let _seed = 0xDEADBEEF;
+function rng() {
+  _seed |= 0; _seed = _seed + 0x6D2B79F5 | 0;
+  let t = Math.imul(_seed ^ _seed >>> 15, 1 | _seed);
+  t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+  return ((t ^ t >>> 14) >>> 0) / 4294967296;
+}
+function resetSeed() { _seed = 0xDEADBEEF; }
+
+// ── CANVAS ───────────────────────────────────────────────────
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const ui = document.getElementById('ui');
+let W, H;
+
+// ── TIME ─────────────────────────────────────────────────────
+let demoMode = true;
+const DEMO_MS = 10 * 60 * 1000;   // 10 real minutes
+const ART_MS  = 12 * 60 * 60 * 1000; // 12 real hours
+let simElapsed = 0; // virtual elapsed ms, advanced by dt * speedMult
+let simT = 0; // [0,1]: 0=dawn 0.5=noon 1=dusk
+
+const SPEED_LEVELS = [1, 2, 4, 8, 16, 32];
+let speedIdx = 0;
+let speedMult = 1;
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'd' || e.key === 'D') { demoMode = !demoMode; initSim(); }
+  if (e.key === 's' || e.key === 'S') {
+    speedIdx = (speedIdx + 1) % SPEED_LEVELS.length;
+    speedMult = SPEED_LEVELS[speedIdx];
+  }
+});
+
+function tickTime() {
+  const raw = simElapsed / (demoMode ? DEMO_MS : ART_MS);
+  simT = Math.min(raw, 1);
+  if (raw >= 1 && !simDone) simDone = true;
+}
+
+function fmtTime() {
+  const mins = (simElapsed / (demoMode ? DEMO_MS : ART_MS)) * 720; // 12 hrs = 720 min, starting 6am
+  const h24 = Math.floor(mins / 60) + 6;
+  const m = String(Math.floor(mins % 60)).padStart(2, '0');
+  const h = h24 > 12 ? h24 - 12 : h24;
+  return `${h}:${m} ${h24 >= 12 ? 'pm' : 'am'}`;
+}
+
+// ── COLOUR UTILS ─────────────────────────────────────────────
+const lerp = (a, b, t) => a + (b - a) * t;
+function lerpRGB(a, b, t) { return [lerp(a[0],b[0],t), lerp(a[1],b[1],t), lerp(a[2],b[2],t)]; }
+function rgb(c) { return `rgb(${c[0]|0},${c[1]|0},${c[2]|0})`; }
+function rgba(c, a) { return `rgba(${c[0]|0},${c[1]|0},${c[2]|0},${a})`; }
+
+// Sky keyframes [t, topRGB, botRGB]
+const SKY_KF = [
+  [0.00, [14,8,38],    [45,25,55]],
+  [0.07, [55,28,85],   [210,105,65]],
+  [0.18, [90,70,155],  [235,165,80]],
+  [0.50, [95,158,220], [205,238,255]],
+  [0.82, [90,70,155],  [235,130,55]],
+  [0.93, [55,28,85],   [180,75,50]],
+  [1.00, [14,8,38],    [40,20,45]],
+];
+
+function sampleSky(t) {
+  for (let i = 1; i < SKY_KF.length; i++) {
+    if (t <= SKY_KF[i][0]) {
+      const f = (t - SKY_KF[i-1][0]) / (SKY_KF[i][0] - SKY_KF[i-1][0]);
+      return [lerpRGB(SKY_KF[i-1][1], SKY_KF[i][1], f),
+              lerpRGB(SKY_KF[i-1][2], SKY_KF[i][2], f)];
+    }
+  }
+  return [SKY_KF.at(-1)[1], SKY_KF.at(-1)[2]];
+}
+
+// ── STARS ────────────────────────────────────────────────────
+let stars = [];
+function genStars() {
+  stars = [];
+  for (let i = 0; i < 160; i++)
+    stars.push({ x: rng(), y: rng() * 0.62, r: rng() * 1.3 + 0.2, tw: rng() * Math.PI * 2 });
+}
+
+function drawStars(ts) {
+  const a = simT < 0.13 ? (1 - simT / 0.13) * 0.8 :
+            simT > 0.87 ? ((simT - 0.87) / 0.13) * 0.8 : 0;
+  if (a <= 0) return;
+  stars.forEach(s => {
+    const tw = 0.65 + Math.sin(ts / 750 + s.tw) * 0.35;
+    ctx.fillStyle = `rgba(255,255,240,${(a * tw).toFixed(3)})`;
+    ctx.beginPath();
+    ctx.arc(s.x * W, s.y * H, s.r, 0, Math.PI * 2);
+    ctx.fill();
+  });
+}
+
+// ── SKY + SUN ────────────────────────────────────────────────
+function drawSky(ts) {
+  const [topC, botC] = sampleSky(simT);
+  const gr = ctx.createLinearGradient(0, 0, 0, H * 0.77);
+  gr.addColorStop(0, rgb(topC));
+  gr.addColorStop(1, rgb(botC));
+  ctx.fillStyle = gr; ctx.fillRect(0, 0, W, H);
+
+  drawStars(ts);
+
+  // Sun arc: left horizon at t=0, apex at t=0.5, right horizon at t=1
+  const sunX = lerp(W * 0.03, W * 0.97, simT);
+  const arcH  = Math.sin(simT * Math.PI);
+  const sunY  = H * 0.76 - arcH * H * 0.76;
+  const sr    = 13 + arcH * 11;
+  const isLow = simT < 0.13 || simT > 0.87;
+  const sunC  = isLow ? [255,138,45] : arcH > 0.7 ? [255,248,200] : [255,210,90];
+
+  const glo = ctx.createRadialGradient(sunX, sunY, 0, sunX, sunY, sr * 5.5);
+  glo.addColorStop(0, rgba(sunC, isLow ? 0.55 : 0.3));
+  glo.addColorStop(1, rgba(sunC, 0));
+  ctx.fillStyle = glo; ctx.beginPath(); ctx.arc(sunX, sunY, sr * 5.5, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = rgb(sunC); ctx.beginPath(); ctx.arc(sunX, sunY, sr, 0, Math.PI * 2); ctx.fill();
+}
+
+// ── GROUND ───────────────────────────────────────────────────
+// Ravine spans between these x fractions; banks at nest/tree are outside
+const RAVINE_X0 = () => W * 0.18;
+const RAVINE_X1 = () => W * 0.72;
+const BANK_Y    = () => H * 0.758; // height of the two banks
+
+function groundProfile(x) {
+  const rx0 = RAVINE_X0(), rx1 = RAVINE_X1();
+  const frac = Math.max(0, Math.min(1, (x - rx0) / (rx1 - rx0)));
+  // sin^0.6 gives steep cliff walls and a wide, flatter floor
+  const dip = Math.pow(Math.sin(frac * Math.PI), 0.6) * H * 0.19;
+  const noise = Math.sin(x / W * Math.PI * 8.1) * H * 0.004
+              + Math.sin(x / W * Math.PI * 3.3) * H * 0.006;
+  return BANK_Y() + dip + noise;
+}
+
+const GY = BANK_Y; // alias used elsewhere
+
+let gDots = [];
+function genGround() {
+  gDots = [];
+  for (let i = 0; i < 900; i++) {
+    const x = rng() * W;
+    const base = groundProfile(x);
+    // Scatter dots within ~7% H of the surface (not filling the whole ravine depth)
+    const y = base + rng() * Math.min(H - base, H * 0.07);
+    gDots.push({ x, y, r: rng() * 2 + 0.3, d: rng() > 0.55 });
+  }
+}
+
+function drawGround(ts) {
+  const rx0 = RAVINE_X0(), rx1 = RAVINE_X1();
+  const bankY = BANK_Y();
+
+  // 1. Lake water — surface colour mirrors the sky for a natural reflection
+  const [, skyBot] = sampleSky(simT);
+  const waterSurf = lerpRGB(skyBot, [22, 88, 152], 0.62);
+  const waterDeep = [6, 22, 52];
+  const wg = ctx.createLinearGradient(0, bankY, 0, H);
+  wg.addColorStop(0,    rgba(waterSurf, 0.90));
+  wg.addColorStop(0.38, rgb(lerpRGB(waterSurf, waterDeep, 0.58)));
+  wg.addColorStop(1,    rgb(waterDeep));
+  ctx.fillStyle = wg;
+  ctx.fillRect(0, bankY - 4, W, H);
+
+  // 2. Ripples and shimmer, clipped to the lake band
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(rx0, bankY, rx1 - rx0, H - bankY);
+  ctx.clip();
+
+  for (let i = 0; i < 9; i++) {
+    const ry  = bankY + (H - bankY) * (0.04 + i * 0.10);
+    const amp = 2.4 - i * 0.18;
+    const ph  = ts / 2300 + i * 1.05;
+    ctx.beginPath();
+    for (let x = rx0; x <= rx1; x += 4) {
+      const y = ry + Math.sin(x / 56 + ph) * amp + Math.sin(x / 21 + ph * 1.45) * amp * 0.36;
+      x === rx0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    }
+    ctx.strokeStyle = `rgba(255,255,255,${(0.09 - i * 0.007).toFixed(3)})`;
+    ctx.lineWidth = 0.75;
+    ctx.stroke();
+  }
+
+  // Drifting shimmer blobs at the surface
+  for (let i = 0; i < 5; i++) {
+    const sx = rx0 + (rx1 - rx0) * (0.1 + i * 0.2);
+    const sy = bankY + H * 0.02 + Math.sin(ts / 1700 + i * 2.2) * H * 0.009;
+    const sa = (Math.sin(ts / 850 + i * 1.8) * 0.5 + 0.5) * 0.16;
+    if (sa < 0.01) continue;
+    const sg = ctx.createRadialGradient(sx, sy, 0, sx, sy, W * 0.036);
+    sg.addColorStop(0, rgba([255, 255, 228], sa));
+    sg.addColorStop(1, rgba([255, 255, 228], 0));
+    ctx.fillStyle = sg;
+    ctx.beginPath(); ctx.arc(sx, sy, W * 0.036, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.restore();
+
+  // 3. Bank-edge shadow where earth meets water
+  const ls = ctx.createLinearGradient(rx0, 0, rx0 + W * 0.05, 0);
+  ls.addColorStop(0, 'rgba(0,0,0,0.30)'); ls.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = ls; ctx.fillRect(rx0, bankY, W * 0.05, H - bankY);
+
+  const rs = ctx.createLinearGradient(rx1, 0, rx1 - W * 0.05, 0);
+  rs.addColorStop(0, 'rgba(0,0,0,0.30)'); rs.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = rs; ctx.fillRect(rx1 - W * 0.05, bankY, W * 0.05, H - bankY);
+
+  // 4. Earth banks
+  const eg = ctx.createLinearGradient(0, bankY, 0, H);
+  eg.addColorStop(0,    '#7c5e3c');
+  eg.addColorStop(0.12, '#6a4d2c');
+  eg.addColorStop(0.45, '#4e3418');
+  eg.addColorStop(1,    '#2c1808');
+  ctx.fillStyle = eg;
+  ctx.beginPath(); ctx.moveTo(0, groundProfile(0));
+  for (let x = 2; x <= W; x += 2) ctx.lineTo(x, groundProfile(x));
+  ctx.lineTo(W, H); ctx.lineTo(0, H); ctx.closePath(); ctx.fill();
+
+  // 5. Surface texture dots — skip the lake area
+  gDots.forEach(d => {
+    if (d.x > rx0 && d.x < rx1 && d.y < groundProfile(d.x)) return;
+    ctx.fillStyle = d.d ? 'rgba(18,8,2,0.32)' : 'rgba(195,155,85,0.22)';
+    ctx.beginPath(); ctx.arc(d.x, d.y, d.r, 0, Math.PI * 2); ctx.fill();
+  });
+}
+
+// ── TREE ─────────────────────────────────────────────────────
+const TX = () => W * 0.80;
+const TY = () => groundProfile(W * 0.80);
+
+let branches = [], leaves = [];
+
+function genTree() {
+  branches = []; leaves = [];
+  const tx = TX(), ty = TY();
+
+  function branch(x, y, angle, len, depth, path) {
+    if (depth === 0 || len < H * 0.010) return;
+    const ex = x + Math.cos(angle) * len;
+    const ey = y - Math.sin(angle) * len;
+    const childPath = [...path, { x: ex, y: ey }];
+    branches.push({ x1:x, y1:y, x2:ex, y2:ey, w: Math.max(1.2, len * 0.088), depth, branchPath: childPath });
+    const spr = 0.32 + rng() * 0.38;
+    branch(ex, ey, angle + spr,           len * (0.58 + rng() * 0.1), depth - 1, childPath);
+    branch(ex, ey, angle - spr,           len * (0.58 + rng() * 0.1), depth - 1, childPath);
+    if (depth > 4 && rng() > 0.38)
+      branch(ex, ey, angle + rng() * 0.2 - 0.1, len * 0.48, depth - 2, childPath);
+  }
+
+  branch(tx, ty, Math.PI / 2, H * 0.24, 8, [{ x: tx, y: ty }]);
+
+  // Leaves on all but the thickest branches (depth ≤ 5)
+  branches.filter(b => b.depth <= 5).forEach(b => {
+    const n = 3 + Math.floor(rng() * 5);
+    for (let i = 0; i < n; i++) {
+      const lx = b.x2 + (rng() - 0.5) * H * 0.028;
+      const ly = b.y2 + (rng() - 0.5) * H * 0.018;
+      if (ly >= ty - 10) continue;
+      const sz = H * 0.008 + rng() * H * 0.013;
+      const g = [32 + rng()*30, 78 + rng()*62, 14 + rng()*28];
+      leaves.push({ x: lx, y: ly, sz, angle: rng() * Math.PI * 2, color: rgb(g),
+                    removed: false, claimedBy: null, id: leaves.length,
+                    branchPath: b.branchPath });
+    }
+  });
+}
+
+function drawTree() {
+  branches.forEach(b => {
+    const shade = b.depth >= 7 ? '#3a2510' : b.depth >= 5 ? '#48321a' : '#5c4025';
+    ctx.strokeStyle = shade; ctx.lineWidth = b.w; ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.moveTo(b.x1, b.y1); ctx.lineTo(b.x2, b.y2); ctx.stroke();
+    if (b.w > 3) {
+      ctx.strokeStyle = 'rgba(210,160,80,0.07)'; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(b.x1 - 1, b.y1); ctx.lineTo(b.x2 - 1, b.y2); ctx.stroke();
+    }
+  });
+  leaves.forEach(l => {
+    if (l.removed) return;
+    ctx.save(); ctx.translate(l.x, l.y); ctx.rotate(l.angle);
+    ctx.fillStyle = l.color;
+    ctx.beginPath(); ctx.ellipse(0, 0, l.sz, l.sz * 0.48, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = 'rgba(0,45,0,0.28)'; ctx.lineWidth = 0.5;
+    ctx.beginPath(); ctx.moveTo(-l.sz, 0); ctx.lineTo(l.sz, 0); ctx.stroke();
+    ctx.restore();
+  });
+}
+
+// ── NEST ─────────────────────────────────────────────────────
+const NX = () => W * 0.10;
+const NY = () => groundProfile(W * 0.10);
+
+function drawNest() {
+  const nx = NX(), ny = NY();
+  // Shadow
+  ctx.fillStyle = 'rgba(0,0,0,0.18)';
+  ctx.beginPath(); ctx.ellipse(nx + 7, ny + 7, 57, 13, 0, 0, Math.PI * 2); ctx.fill();
+  // Mound
+  const mg = ctx.createRadialGradient(nx, ny - 6, 2, nx, ny + 2, 54);
+  mg.addColorStop(0, '#6e3f1c'); mg.addColorStop(0.65, '#4e2c0c'); mg.addColorStop(1, '#381e08');
+  ctx.fillStyle = mg;
+  ctx.beginPath(); ctx.ellipse(nx, ny, 52, 19, 0, 0, Math.PI * 2); ctx.fill();
+  // Hole
+  ctx.fillStyle = '#0d0500';
+  ctx.beginPath(); ctx.ellipse(nx, ny + 5, 13, 7, 0, 0, Math.PI * 2); ctx.fill();
+  ctx.strokeStyle = '#3c1e08'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.ellipse(nx, ny + 5, 13, 7, 0, 0, Math.PI * 2); ctx.stroke();
+}
+
+// ── UNDERGROUND COLONY ───────────────────────────────────────
+let colony = { segs: [], chambers: [], eggs: [] };
+
+function genUnderground() {
+  colony = { segs: [], chambers: [], eggs: [] };
+  // Depths below nest surface (in pixels)
+  const dA = H * 0.050;  // first junction
+  const dB = H * 0.085;  // second junction
+  const dC = H * 0.128;  // queen chamber
+  const tw = Math.max(7, H * 0.013); // tunnel half-width
+
+  // Entrance shaft + main spine
+  colony.segs.push({ x1:0, y1:6, x2:0, y2:dA });
+  colony.segs.push({ x1:0, y1:dA, x2:0, y2:dC });
+
+  // Left nursery gallery
+  const lx = -(W * 0.038 + rng() * W * 0.012);
+  const ly = dA + H * 0.022 + rng() * H * 0.01;
+  colony.segs.push({ x1:0, y1:dA * 0.65, x2:lx, y2:ly });
+  colony.chambers.push({ x:lx, y:ly, rx:W*0.022+rng()*W*0.008, ry:H*0.017+rng()*H*0.006, type:'nursery' });
+
+  // Right food-store gallery
+  const fx = W * 0.030 + rng() * W * 0.010;
+  const fy = dA * 0.45 + rng() * H * 0.012;
+  colony.segs.push({ x1:0, y1:dA * 0.35, x2:fx, y2:fy });
+  colony.chambers.push({ x:fx, y:fy, rx:W*0.016+rng()*W*0.006, ry:H*0.013+rng()*H*0.005, type:'food' });
+
+  // Junction chamber at dB
+  colony.chambers.push({ x:0, y:dB, rx:tw*1.6, ry:tw*1.1, type:'junction' });
+
+  // Small side-storage at dB
+  const sx = -(W * 0.026 + rng() * W * 0.009);
+  const sy = dB + H * 0.020 + rng() * H * 0.009;
+  colony.segs.push({ x1:0, y1:dB, x2:sx, y2:sy });
+  colony.chambers.push({ x:sx, y:sy, rx:tw*1.2, ry:tw*0.85, type:'storage' });
+
+  // Queen chamber
+  colony.chambers.push({ x:0, y:dC, rx:W*0.033+rng()*W*0.006, ry:H*0.024+rng()*H*0.008, type:'queen' });
+
+  // Eggs in nursery
+  const nur = colony.chambers.find(c => c.type === 'nursery');
+  for (let i = 0; i < 18 + Math.floor(rng() * 8); i++)
+    colony.eggs.push({ x: nur.x + (rng()-0.5)*nur.rx*1.5, y: nur.y + (rng()-0.5)*nur.ry*1.5,
+                       rx: 1.4+rng()*1.1, ry: 2.2+rng()*1.4, ang: rng()*Math.PI });
+
+  // Eggs in queen chamber
+  const qc = colony.chambers.find(c => c.type === 'queen');
+  for (let i = 0; i < 26 + Math.floor(rng() * 10); i++)
+    colony.eggs.push({ x: qc.x + (rng()-0.5)*qc.rx*1.5, y: qc.y + (rng()-0.5)*qc.ry*1.5,
+                       rx: 1.5+rng()*1.2, ry: 2.4+rng()*1.5, ang: rng()*Math.PI });
+}
+
+function drawNestUnderground() {
+  const nx = NX(), ny = NY();
+  const tw = Math.max(7, H * 0.013);
+
+  ctx.save();
+  // Clip to underground region below the nest surface
+  ctx.beginPath();
+  ctx.rect(nx - W * 0.13, ny - 1, W * 0.26, H - ny + 1);
+  ctx.clip();
+
+  function tube(x1, y1, x2, y2) {
+    ctx.lineCap = 'round';
+    ctx.strokeStyle = '#100702'; ctx.lineWidth = tw * 2.2;
+    ctx.beginPath(); ctx.moveTo(nx+x1, ny+y1); ctx.lineTo(nx+x2, ny+y2); ctx.stroke();
+    ctx.strokeStyle = '#2a1308'; ctx.lineWidth = tw * 1.3;
+    ctx.beginPath(); ctx.moveTo(nx+x1, ny+y1); ctx.lineTo(nx+x2, ny+y2); ctx.stroke();
+  }
+
+  function chamber(c) {
+    ctx.fillStyle = '#0f0601';
+    ctx.beginPath(); ctx.ellipse(nx+c.x, ny+c.y, c.rx+3, c.ry+3, 0, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = c.type === 'queen' ? '#1e0e05' : '#261208';
+    ctx.beginPath(); ctx.ellipse(nx+c.x, ny+c.y, c.rx, c.ry, 0, 0, Math.PI*2); ctx.fill();
+    if (c.type === 'queen') {
+      // Warm amber glow hinting at the queen's presence
+      const qg = ctx.createRadialGradient(nx+c.x, ny+c.y, 0, nx+c.x, ny+c.y, c.rx * 0.85);
+      qg.addColorStop(0, 'rgba(200,100,20,0.12)');
+      qg.addColorStop(1, 'rgba(200,100,20,0)');
+      ctx.fillStyle = qg;
+      ctx.beginPath(); ctx.ellipse(nx+c.x, ny+c.y, c.rx, c.ry, 0, 0, Math.PI*2); ctx.fill();
+      // Queen body — large oval with legs suggested
+      ctx.fillStyle = '#1a0c04';
+      ctx.beginPath(); ctx.ellipse(nx+c.x, ny+c.y+2, c.rx*0.38, c.ry*0.48, 0, 0, Math.PI*2); ctx.fill();
+      ctx.fillStyle = '#241008';
+      ctx.beginPath(); ctx.ellipse(nx+c.x+c.rx*0.08, ny+c.y, c.rx*0.18, c.ry*0.22, 0, 0, Math.PI*2); ctx.fill();
+    }
+    if (c.type === 'nursery') {
+      // Faint blue-white glow for larval chamber
+      ctx.fillStyle = 'rgba(200,220,255,0.04)';
+      ctx.beginPath(); ctx.ellipse(nx+c.x, ny+c.y, c.rx, c.ry, 0, 0, Math.PI*2); ctx.fill();
+    }
+  }
+
+  colony.segs.forEach(s => tube(s.x1, s.y1, s.x2, s.y2));
+  colony.chambers.forEach(chamber);
+
+  // Eggs — small cream ovals, count grows with the ant population
+  const visibleEggs = Math.min(ants.length, colony.eggs.length);
+  colony.eggs.slice(0, visibleEggs).forEach(e => {
+    ctx.fillStyle = 'rgba(242,236,205,0.82)';
+    ctx.beginPath(); ctx.ellipse(nx+e.x, ny+e.y, e.rx, e.ry, e.ang, 0, Math.PI*2); ctx.fill();
+  });
+
+  ctx.restore();
+}
+
+// ── POLE ─────────────────────────────────────────────────────
+const POLE_H  = () => H * 0.058;
+const POLE_PW = () => Math.max(3, H * 0.007);
+const POLE_X  = () => W * 0.155;
+const POLE_GY = () => groundProfile(POLE_X());
+const POLE_TY = () => POLE_GY() - POLE_H();
+
+function drawPole() {
+  const pw  = POLE_PW();
+  const px  = POLE_X();
+  const pgy = POLE_GY();
+  const pty = POLE_TY();
+
+  // Base shadow
+  ctx.fillStyle = 'rgba(0,0,0,0.18)';
+  ctx.beginPath();
+  ctx.ellipse(px + pw * 1.8, pgy - 1, pw * 2.5, pw * 0.5, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Shaft
+  const sg = ctx.createLinearGradient(px - pw, 0, px + pw * 2, 0);
+  sg.addColorStop(0,    '#2e1a0a');
+  sg.addColorStop(0.35, '#6a4220');
+  sg.addColorStop(0.65, '#8c5a28');
+  sg.addColorStop(1,    '#3e2412');
+  ctx.fillStyle = sg;
+  ctx.fillRect(px - pw, pty, pw * 2, pgy - pty);
+
+  // Rope lashing near the top
+  ctx.strokeStyle = '#7a5020'; ctx.lineWidth = 1.1;
+  for (let i = 0; i < 3; i++) {
+    const ly = pty + pw * (1.1 + i * 1.3);
+    ctx.beginPath(); ctx.moveTo(px - pw, ly); ctx.lineTo(px + pw, ly); ctx.stroke();
+  }
+
+  // Rounded cap
+  ctx.fillStyle = '#503010';
+  ctx.beginPath();
+  ctx.ellipse(px, pty, pw * 1.7, pw * 0.6, 0, 0, Math.PI * 2);
+  ctx.fill();
+}
+
+// ── ROPE ─────────────────────────────────────────────────────
+function ropeAt(frac, ts) {
+  const px = POLE_X(), py = POLE_TY(); // rope anchors at pole top
+  const tx = TX(), ty = TY() - H * 0.032;
+  const x = px + (tx - px) * frac;
+  const sag  = H * 0.11 * Math.sin(frac * Math.PI);
+  const sway = 2.8 * Math.sin(ts / 3600 + frac * Math.PI * 1.6);
+  return { x, y: py + (ty - py) * frac + sag + sway };
+}
+
+function drawRope(ts) {
+  ctx.save(); ctx.strokeStyle = '#8a5e2c'; ctx.lineWidth = 2.2; ctx.lineCap = 'round';
+  ctx.beginPath();
+  const p0 = ropeAt(0, ts); ctx.moveTo(p0.x, p0.y);
+  for (let i = 1; i <= 80; i++) { const p = ropeAt(i / 80, ts); ctx.lineTo(p.x, p.y); }
+  ctx.stroke();
+  // Tick marks
+  ctx.strokeStyle = '#583a14'; ctx.lineWidth = 0.8;
+  for (let i = 1; i < 80; i += 4) {
+    const p  = ropeAt(i / 80, ts);
+    const p2 = ropeAt((i + 0.5) / 80, ts);
+    const dx = p2.x - p.x, dy = p2.y - p.y, len = Math.hypot(dx, dy) || 1;
+    const nx2 = -dy / len * 3.5, ny2 = dx / len * 3.5;
+    ctx.beginPath(); ctx.moveTo(p.x - nx2, p.y - ny2); ctx.lineTo(p.x + nx2, p.y + ny2); ctx.stroke();
+  }
+
+  // Rope wraps around trunk at attachment point
+  const aX = TX();
+  const aY = TY() - H * 0.032;
+  const tr = Math.max(8, H * 0.011); // scaled to trunk width (root branch w = H*0.24*0.088/2)
+  const wo = tr + 6;      // horizontal overhang beyond trunk edge
+  const wh = tr * 0.90;   // arc height per wrap
+  const ws = tr * 1.40;   // spacing between wrap rows
+  ctx.strokeStyle = '#8a5e2c'; ctx.lineWidth = 2.2; ctx.lineCap = 'round';
+
+  // Wrap 1 front
+  ctx.beginPath();
+  ctx.moveTo(aX - tr, aY);
+  ctx.bezierCurveTo(aX - tr - wo, aY - wh, aX + tr + wo, aY - wh, aX + tr, aY);
+  ctx.stroke();
+  // Wrap 1 back (dimmed)
+  ctx.save(); ctx.globalAlpha = 0.28;
+  ctx.beginPath();
+  ctx.moveTo(aX + tr, aY);
+  ctx.bezierCurveTo(aX + tr + wo, aY + wh * 0.88, aX - tr - wo, aY + wh * 0.88, aX - tr, aY + ws);
+  ctx.stroke();
+  ctx.restore();
+
+  // Wrap 2 front
+  ctx.beginPath();
+  ctx.moveTo(aX - tr, aY + ws);
+  ctx.bezierCurveTo(aX - tr - wo, aY + ws - wh, aX + tr + wo, aY + ws - wh, aX + tr, aY + ws);
+  ctx.stroke();
+  // Wrap 2 back (dimmed)
+  ctx.save(); ctx.globalAlpha = 0.28;
+  ctx.beginPath();
+  ctx.moveTo(aX + tr, aY + ws);
+  ctx.bezierCurveTo(aX + tr + wo, aY + ws + wh * 0.88, aX - tr - wo, aY + ws + wh * 0.88, aX - tr, aY + ws * 2);
+  ctx.stroke();
+  ctx.restore();
+
+  // Wrap 3 front
+  ctx.beginPath();
+  ctx.moveTo(aX - tr, aY + ws * 2);
+  ctx.bezierCurveTo(aX - tr - wo, aY + ws * 2 - wh, aX + tr + wo, aY + ws * 2 - wh, aX + tr, aY + ws * 2);
+  ctx.stroke();
+  // Wrap 3 back (dimmed)
+  ctx.save(); ctx.globalAlpha = 0.28;
+  ctx.beginPath();
+  ctx.moveTo(aX + tr, aY + ws * 2);
+  ctx.bezierCurveTo(aX + tr + wo, aY + ws * 2 + wh * 0.88, aX - tr - wo, aY + ws * 2 + wh * 0.88, aX - tr, aY + ws * 3);
+  ctx.stroke();
+  ctx.restore();
+
+  // Loose tail dangling from the last wrap
+  ctx.strokeStyle = '#7a5228';
+  ctx.beginPath();
+  ctx.moveTo(aX - tr, aY + ws * 3);
+  ctx.bezierCurveTo(aX - tr - wo * 1.2, aY + ws * 3 + wh * 1.4, aX - tr - wo * 0.5, aY + ws * 3 + wh * 2.8, aX - tr + wo * 0.4, aY + ws * 3 + wh * 2.2);
+  ctx.stroke();
+
+  ctx.restore();
+}
+
+// ── ANTS ─────────────────────────────────────────────────────
+const S = { GROUND_OUT:'GROUND_OUT', CLIMB:'CLIMB', OUT:'OUT', FORAGE:'FORAGE', CUT:'CUT', BACK_BRANCH:'BACK_BRANCH', BACK:'BACK', CLIMB_DOWN:'CLIMB_DOWN', GROUND_BACK:'GROUND_BACK', ENTER:'ENTER' };
+
+class Ant {
+  constructor(id) {
+    this.id    = id;
+    this.done  = false;
+    this.state = S.GROUND_OUT;
+    this.frac  = 0;
+    this.spd   = 0.034 + rng() * 0.026;
+    this.scale = 0.72 + rng() * 0.52;
+    this.leaf  = null;
+    this.cutT      = 0;
+    this.x = NX(); this.y = NY() + 5;
+    this.ang       = 0;
+    this.legPh     = rng() * Math.PI * 2;
+    this.waitT     = rng() * 4;
+    this.vis       = false;
+    this.waypoints = [];
+    this.wpIdx     = 0;
+  }
+
+  update(dt, ts) {
+    if (this.done) return;
+    this.waitT -= dt;
+    if (this.waitT > 0) { this.vis = false; return; }
+    this.vis = true;
+    this.legPh += dt * 14;
+
+    if (simDone) {
+      if (this.state === S.OUT) {
+        this.state = S.BACK;
+      } else if (this.state === S.FORAGE || this.state === S.CUT) {
+        if (this.leaf) { this.leaf.claimedBy = null; this.leaf = null; }
+        this.wpIdx = Math.max(0, this.waypoints.length - 2);
+        this.state = S.BACK_BRANCH;
+      } else if (this.state === S.GROUND_OUT) {
+        this.state = S.GROUND_BACK;
+      } else if (this.state === S.CLIMB) {
+        this.state = S.CLIMB_DOWN;
+      }
+    }
+
+    if (this.state === S.GROUND_OUT) {
+      // Walk along ground surface from nest hole to pole base
+      const targetX = POLE_X();
+      const spd = this.spd * W * 0.55 * dt;
+      const dx = targetX - this.x;
+      if (Math.abs(dx) <= spd) {
+        this.x = targetX; this.y = POLE_GY();
+        this.state = S.CLIMB;
+      } else {
+        const dir = dx > 0 ? 1 : -1;
+        this.x += dir * spd;
+        this.y = groundProfile(this.x);
+        this.ang = Math.atan2(groundProfile(this.x + dir * 3) - this.y, dir * 3);
+      }
+
+    } else if (this.state === S.CLIMB) {
+      // Climb the pole upward
+      const targetY = POLE_TY();
+      const spd = this.spd * W * 0.55 * dt;
+      if (this.y - targetY <= spd) {
+        this.x = POLE_X(); this.y = POLE_TY();
+        this.frac = 0;
+        this.state = S.OUT;
+      } else {
+        this.y -= spd;
+        this.x = POLE_X();
+        this.ang = -Math.PI / 2;
+      }
+
+    } else if (this.state === S.OUT) {
+      this.frac += this.spd * dt;
+      if (this.frac >= 1) {
+        this.frac = 1;
+        const avail = leaves.filter(l => !l.removed && l.claimedBy == null);
+        if (avail.length > 0) {
+          const picked = avail[Math.floor(Math.random() * avail.length)];
+          picked.claimedBy = this.id;
+          this.leaf = picked;
+          const ropeAY = TY() - H * 0.032;
+          const rawPath = picked.branchPath ? [...picked.branchPath] : [];
+          this.waypoints = [{ x: TX(), y: ropeAY }, ...rawPath.filter(wp => wp.y < ropeAY - 2)];
+          this.wpIdx = 0;
+          this.state = S.FORAGE;
+        } else {
+          this.state = S.BACK;
+        }
+      } else {
+        const p = ropeAt(this.frac, ts), p2 = ropeAt(Math.min(this.frac + 0.005, 1), ts);
+        this.x = p.x; this.y = p.y;
+        this.ang = Math.atan2(p2.y - p.y, p2.x - p.x);
+      }
+
+    } else if (this.state === S.FORAGE) {
+      if (this.wpIdx < this.waypoints.length) {
+        const wp = this.waypoints[this.wpIdx];
+        const dx = wp.x - this.x, dy = wp.y - this.y;
+        const dist = Math.hypot(dx, dy);
+        if (dist < 4) { this.wpIdx++; }
+        else {
+          const step = this.spd * W * 0.55 * dt;
+          this.x += (dx / dist) * Math.min(step, dist);
+          this.y += (dy / dist) * Math.min(step, dist);
+          this.ang = Math.atan2(dy, dx);
+        }
+      } else {
+        this.state = S.CUT;
+        this.cutT = 0.55 + Math.random() * 0.9;
+      }
+
+    } else if (this.state === S.CUT) {
+      if (this.leaf) {
+        const dx = this.leaf.x - this.x, dy = this.leaf.y - this.y;
+        this.x += dx * Math.min(dt * 4, 1) + (Math.random() - 0.5) * 1.4;
+        this.y += dy * Math.min(dt * 4, 1) + (Math.random() - 0.5) * 1.4;
+        if (Math.hypot(dx, dy) > 2) this.ang = Math.atan2(dy, dx);
+      }
+      this.cutT -= dt;
+      if (this.cutT <= 0 && this.leaf) {
+        this.leaf.removed = true;
+        spawnParticle(this.leaf);
+        this.wpIdx = this.waypoints.length - 2;
+        this.state = S.BACK_BRANCH;
+      }
+
+    } else if (this.state === S.BACK_BRANCH) {
+      if (this.wpIdx >= 0) {
+        const wp = this.waypoints[this.wpIdx];
+        const dx = wp.x - this.x, dy = wp.y - this.y;
+        const dist = Math.hypot(dx, dy);
+        if (dist < 4) { this.wpIdx--; }
+        else {
+          const step = this.spd * W * 0.55 * dt;
+          this.x += (dx / dist) * Math.min(step, dist);
+          this.y += (dy / dist) * Math.min(step, dist);
+          this.ang = Math.atan2(dy, dx);
+        }
+      } else {
+        this.frac = 1;
+        this.state = S.BACK;
+      }
+
+    } else if (this.state === S.BACK) {
+      this.frac -= this.spd * dt;
+      if (this.frac <= 0) {
+        this.frac = 0;
+        this.x = POLE_X(); this.y = POLE_TY();
+        this.state = S.CLIMB_DOWN;
+      } else {
+        const p = ropeAt(this.frac, ts), p2 = ropeAt(Math.max(this.frac - 0.005, 0), ts);
+        this.x = p.x; this.y = p.y;
+        this.ang = Math.atan2(p2.y - p.y, p2.x - p.x);
+      }
+
+    } else if (this.state === S.CLIMB_DOWN) {
+      // Descend the pole
+      const targetY = POLE_GY();
+      const spd = this.spd * W * 0.55 * dt;
+      if (targetY - this.y <= spd) {
+        this.x = POLE_X(); this.y = POLE_GY();
+        this.state = S.GROUND_BACK;
+      } else {
+        this.y += spd;
+        this.x = POLE_X();
+        this.ang = Math.PI / 2;
+      }
+
+    } else if (this.state === S.GROUND_BACK) {
+      // Walk along ground surface from pole base back to nest hole
+      const targetX = NX();
+      const spd = this.spd * W * 0.55 * dt;
+      const dx = targetX - this.x;
+      if (Math.abs(dx) <= spd) {
+        this.x = targetX; this.y = NY() + 5;
+        this.state = S.ENTER;
+      } else {
+        const dir = dx > 0 ? 1 : -1;
+        this.x += dir * spd;
+        this.y = groundProfile(this.x);
+        this.ang = Math.atan2(groundProfile(this.x + dir * 3) - this.y, dir * 3);
+      }
+
+    } else if (this.state === S.ENTER) {
+      this.vis = false;
+      if (simDone) { this.done = true; return; }
+      this.waitT = 0.3 + Math.random() * 0.8;
+      this.state = S.GROUND_OUT; this.frac = 0;
+      this.leaf = null;
+      this.x = NX(); this.y = NY() + 5;
+    }
+  }
+
+  draw(ts) {
+    if (!this.vis) return;
+    const s = this.scale;
+    ctx.save(); ctx.translate(this.x, this.y);
+
+    // Leaf carried above (in screen space, before body rotation)
+    if ((this.state === S.BACK || this.state === S.BACK_BRANCH || this.state === S.CLIMB_DOWN || this.state === S.GROUND_BACK) && this.leaf) {
+      ctx.save();
+      ctx.translate(0, -15 * s);
+      ctx.rotate(this.leaf.angle);
+      ctx.fillStyle = this.leaf.color;
+      ctx.beginPath(); ctx.ellipse(0, 0, this.leaf.sz * 0.85, this.leaf.sz * 0.42, 0, 0, Math.PI * 2); ctx.fill();
+      ctx.strokeStyle = 'rgba(0,50,0,0.25)'; ctx.lineWidth = 0.5;
+      ctx.beginPath(); ctx.moveTo(-this.leaf.sz, 0); ctx.lineTo(this.leaf.sz, 0); ctx.stroke();
+      ctx.restore();
+    }
+
+    ctx.rotate(this.ang);
+
+    // Legs (3 pairs)
+    const legX = [-5 * s, -1 * s, 3 * s];
+    ctx.strokeStyle = '#1c0e06'; ctx.lineCap = 'round';
+    legX.forEach((lx, i) => {
+      const phA = this.legPh, phB = this.legPh + Math.PI;
+      ctx.lineWidth = 0.7 * s;
+      // Left leg (goes below in local space)
+      const sinL = Math.sin(i % 2 === 0 ? phA : phB);
+      ctx.beginPath(); ctx.moveTo(lx, 0); ctx.lineTo(lx - 2 * s, 5 * s + sinL * 2.5 * s); ctx.stroke();
+      // Right leg (goes above)
+      const sinR = Math.sin(i % 2 === 0 ? phB : phA);
+      ctx.beginPath(); ctx.moveTo(lx, 0); ctx.lineTo(lx + 2 * s, -5 * s - sinR * 2.5 * s); ctx.stroke();
+    });
+
+    // Abdomen
+    ctx.fillStyle = '#1e1008';
+    ctx.beginPath(); ctx.ellipse(-5 * s, 0, 5.5 * s, 3.2 * s, 0.15, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = 'rgba(110,75,40,0.18)';
+    ctx.beginPath(); ctx.ellipse(-6 * s, -1.2 * s, 3 * s, 1.4 * s, 0.1, 0, Math.PI * 2); ctx.fill();
+
+    // Thorax
+    ctx.fillStyle = '#1a0e08';
+    ctx.beginPath(); ctx.arc(0.5 * s, 0, 2.4 * s, 0, Math.PI * 2); ctx.fill();
+
+    // Head
+    ctx.fillStyle = '#200f08';
+    ctx.beginPath(); ctx.arc(5 * s, -0.2 * s, 2.7 * s, 0, Math.PI * 2); ctx.fill();
+
+    // Mandibles
+    ctx.strokeStyle = '#2c1808'; ctx.lineWidth = 0.8 * s;
+    ctx.beginPath(); ctx.moveTo(7.2 * s, -0.8 * s); ctx.lineTo(9.8 * s, -3 * s); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(7.2 * s, 0.5 * s);  ctx.lineTo(9.8 * s, 2.8 * s); ctx.stroke();
+
+    // Antennae
+    const aph = Math.sin(ts / 480 + this.legPh) * 0.12;
+    ctx.strokeStyle = '#1c0e06'; ctx.lineWidth = 0.55 * s;
+    ctx.beginPath(); ctx.moveTo(6.5 * s, -1 * s);
+    ctx.quadraticCurveTo(9 * s, -7 * s, 12.5 * s + aph * 8, -5.5 * s); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(6.5 * s, -1 * s);
+    ctx.quadraticCurveTo(10 * s, -4 * s + aph * 8, 13.5 * s, -1.5 * s); ctx.stroke();
+
+    ctx.restore();
+  }
+}
+
+let ants = [];
+let simDone = false, fadeOverlay = 0, fadeStarted = false;
+
+function targetCount() {
+  if (simDone) return 0;
+  if (simT < 0.05) return 5;
+  if (simT < 0.38) return Math.floor(5 + 35 * (simT - 0.05) / 0.33);
+  if (simT < 0.65) return 40;
+  if (simT < 0.92) return Math.floor(40 - 14 * (simT - 0.65) / 0.27);
+  return 26;
+}
+function tickAnts(dt, ts) {
+  while (ants.length < targetCount()) ants.push(new Ant(ants.length));
+  ants.forEach(a => a.update(dt, ts));
+}
+
+// ── LEAF PARTICLES ───────────────────────────────────────────
+let particles = [];
+function spawnParticle(leaf) {
+  particles.push({ x: leaf.x, y: leaf.y,
+    vx: (Math.random() - 0.5) * 1.8, vy: -Math.random() * 1.2 - 0.3,
+    rot: leaf.angle, vrot: (Math.random() - 0.5) * 3,
+    sz: leaf.sz * 0.75, color: leaf.color, life: 1 });
+}
+function tickParticles(dt) {
+  particles = particles.filter(p => p.life > 0);
+  particles.forEach(p => { p.vy += 0.35 * dt; p.x += p.vx; p.y += p.vy;
+    p.rot += p.vrot * dt; p.life -= dt * 0.5; });
+}
+function drawParticles() {
+  particles.forEach(p => {
+    ctx.save(); ctx.globalAlpha = p.life; ctx.translate(p.x, p.y); ctx.rotate(p.rot);
+    ctx.fillStyle = p.color;
+    ctx.beginPath(); ctx.ellipse(0, 0, p.sz, p.sz * 0.46, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+  });
+  ctx.globalAlpha = 1;
+}
+
+// ── FILM GRAIN ───────────────────────────────────────────────
+const GRAIN = 256;
+const gCan  = document.createElement('canvas');
+gCan.width  = gCan.height = GRAIN;
+const gCtx  = gCan.getContext('2d');
+let gFrame  = 0;
+
+function updateGrain() {
+  const d = gCtx.createImageData(GRAIN, GRAIN);
+  for (let i = 0; i < d.data.length; i += 4) {
+    const v = (Math.random() * 255) | 0;
+    d.data[i] = d.data[i+1] = d.data[i+2] = v;
+    d.data[i+3] = 22;
+  }
+  gCtx.putImageData(d, 0, 0);
+}
+
+function drawGrain() {
+  if (++gFrame % 2 === 0) updateGrain();
+  ctx.save(); ctx.globalAlpha = 0.045;
+  for (let x = 0; x < W; x += GRAIN)
+    for (let y = 0; y < H; y += GRAIN)
+      ctx.drawImage(gCan, x, y);
+  ctx.restore();
+}
+
+// ── COLOUR TEMPERATURE TINT ──────────────────────────────────
+function drawTint() {
+  let a = 0, c = [255, 140, 55];
+  if (simT < 0.16) { a = (1 - simT / 0.16) * 0.11; }
+  else if (simT > 0.84) { a = ((simT - 0.84) / 0.16) * 0.14; c = [210, 80, 38]; }
+  if (a > 0) { ctx.fillStyle = rgba(c, a); ctx.fillRect(0, 0, W, H); }
+}
+
+// ── BIRDS ────────────────────────────────────────────────────
+let birds = [];
+function spawnBird() {
+  const fromLeft = Math.random() > 0.5;
+  birds.push({ x: fromLeft ? -50 : W + 50, y: H * (0.12 + Math.random() * 0.3),
+    vx: (fromLeft ? 1 : -1) * (0.8 + Math.random() * 0.6),
+    flapPh: Math.random() * Math.PI * 2, sz: 6 + Math.random() * 5 });
+}
+let birdTimer = 8;
+function tickBirds(dt) {
+  birdTimer -= dt;
+  if (birdTimer <= 0 && simT > 0.05 && simT < 0.95) {
+    spawnBird(); birdTimer = 15 + Math.random() * 25;
+  }
+  birds = birds.filter(b => b.x > -100 && b.x < W + 100);
+  birds.forEach(b => { b.x += b.vx; b.flapPh += dt * 5; });
+}
+function drawBirds(ts) {
+  birds.forEach(b => {
+    const flap = Math.sin(b.flapPh) * b.sz * 0.7;
+    ctx.save(); ctx.translate(b.x, b.y);
+    ctx.strokeStyle = 'rgba(20,12,5,0.55)'; ctx.lineWidth = 1.2; ctx.lineCap = 'round';
+    // V-shaped wings
+    ctx.beginPath();
+    ctx.moveTo(-b.sz, -flap); ctx.quadraticCurveTo(0, 0, b.sz, -flap);
+    ctx.stroke();
+    ctx.restore();
+  });
+}
+
+// ── INIT & RESIZE ────────────────────────────────────────────
+function initSim() {
+  resetSeed();
+  simElapsed = 0; simT = 0;
+  ants = []; particles = []; birds = [];
+  birdTimer = 8; gFrame = 0;
+  simDone = false; fadeOverlay = 0; fadeStarted = false;
+  genStars(); genGround(); genTree(); genUnderground();
+  updateGrain();
+}
+
+function resize() {
+  W = canvas.width  = window.innerWidth;
+  H = canvas.height = window.innerHeight;
+  initSim();
+}
+window.addEventListener('resize', resize);
+
+// ── MAIN LOOP ────────────────────────────────────────────────
+let prevTS = 0;
+function loop(ts) {
+  if (!prevTS) prevTS = ts;
+  const realDt = Math.min((ts - prevTS) / 1000, 0.05);
+  const dt = realDt * speedMult;
+  prevTS = ts;
+  simElapsed += dt * 1000;
+  tickTime();
+
+  ctx.clearRect(0, 0, W, H);
+  drawSky(ts);
+  drawGround(ts);
+  drawNestUnderground();
+  drawNest();
+  drawPole();
+  drawTree();
+  drawRope(ts);
+  tickBirds(dt);
+  drawBirds(ts);
+  tickAnts(dt, ts);
+  ants.forEach(a => a.draw(ts));
+  tickParticles(dt);
+  drawParticles();
+  drawTint();
+  drawGrain();
+
+  if (simDone) {
+    if (!fadeStarted && ants.every(a => a.done)) fadeStarted = true;
+    if (fadeStarted) {
+      const fadeDur = demoMode ? 15 : 1800; // 15s demo / 30min art
+      fadeOverlay = Math.min(1, fadeOverlay + dt / fadeDur);
+      ctx.fillStyle = `rgba(0,0,0,${fadeOverlay.toFixed(3)})`;
+      ctx.fillRect(0, 0, W, H);
+      if (fadeOverlay >= 1) { initSim(); }
+    }
+  }
+
+  ui.textContent = `${fmtTime()}  ·  ${demoMode ? 'demo' : 'art'}  ·  ×${speedMult}  ·  D / S`;
+  requestAnimationFrame(loop);
+}
+
+resize();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
