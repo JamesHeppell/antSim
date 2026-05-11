@@ -40,6 +40,7 @@ const DEMO_MS = 10 * 60 * 1000;   // 10 real minutes
 const ART_MS  = 12 * 60 * 60 * 1000; // 12 real hours
 let simElapsed = 0; // virtual elapsed ms, advanced by dt * speedMult
 let simT = 0; // [0,1]: 0=dawn 0.5=noon 1=dusk
+let paused = false;
 
 const SPEED_LEVELS = [1, 2, 4, 8, 16, 32];
 let speedIdx = 0;
@@ -51,6 +52,7 @@ document.addEventListener('keydown', e => {
     speedIdx = (speedIdx + 1) % SPEED_LEVELS.length;
     speedMult = SPEED_LEVELS[speedIdx];
   }
+  if (e.key === 'p' || e.key === 'P') { paused = !paused; }
 });
 
 function tickTime() {
@@ -252,7 +254,7 @@ function drawGround(ts) {
 const TX = () => W * 0.80;
 const TY = () => groundProfile(W * 0.80);
 
-let branches = [], leaves = [];
+let branches = [], leaves = [], roots = [];
 
 function genTree() {
   branches = []; leaves = [];
@@ -263,24 +265,36 @@ function genTree() {
     const ex = x + Math.cos(angle) * len;
     const ey = y - Math.sin(angle) * len;
     const childPath = [...path, { x: ex, y: ey }];
-    branches.push({ x1:x, y1:y, x2:ex, y2:ey, w: Math.max(1.2, len * 0.088), depth, branchPath: childPath });
+    branches.push({ x1:x, y1:y, x2:ex, y2:ey, w: Math.max(1.2, len * 0.105), depth, branchPath: childPath });
     const spr = 0.32 + rng() * 0.38;
     branch(ex, ey, angle + spr,           len * (0.58 + rng() * 0.1), depth - 1, childPath);
     branch(ex, ey, angle - spr,           len * (0.58 + rng() * 0.1), depth - 1, childPath);
     if (depth > 4 && rng() > 0.38)
       branch(ex, ey, angle + rng() * 0.2 - 0.1, len * 0.48, depth - 2, childPath);
+    // Fuller canopy: lateral arms at multiple levels
+    if (depth === 7) {
+      // Always spawn both left and right wide arms at the first fork
+      branch(ex, ey, angle + (1.15 + rng() * 0.20), len * 0.54, depth - 2, childPath);
+      if (rng() > 0.22) branch(ex, ey, angle - (1.10 + rng() * 0.20), len * 0.50, depth - 2, childPath);
+    } else if (depth === 6 && rng() > 0.28) {
+      const side = rng() > 0.5 ? 1 : -1;
+      branch(ex, ey, angle + side * (1.05 + rng() * 0.25), len * 0.52, depth - 2, childPath);
+    } else if (depth === 5 && rng() > 0.45) {
+      const side = rng() > 0.5 ? 1 : -1;
+      branch(ex, ey, angle + side * (0.85 + rng() * 0.35), len * 0.46, depth - 2, childPath);
+    }
   }
 
-  branch(tx, ty, Math.PI / 2, H * 0.24, 8, [{ x: tx, y: ty }]);
+  branch(tx, ty, Math.PI / 2, H * 0.26, 8, [{ x: tx, y: ty }]);
 
-  // Leaves on all but the thickest branches (depth ≤ 5)
-  branches.filter(b => b.depth <= 5).forEach(b => {
-    const n = 3 + Math.floor(rng() * 5);
+  // Leaves on branches up to depth 7 for a denser, fuller crown
+  branches.filter(b => b.depth <= 7).forEach(b => {
+    const n = 4 + Math.floor(rng() * 5);
     for (let i = 0; i < n; i++) {
-      const lx = b.x2 + (rng() - 0.5) * H * 0.028;
-      const ly = b.y2 + (rng() - 0.5) * H * 0.018;
+      const lx = b.x2 + (rng() - 0.5) * H * 0.030;
+      const ly = b.y2 + (rng() - 0.5) * H * 0.020;
       if (ly >= ty - 10) continue;
-      const sz = H * 0.008 + rng() * H * 0.013;
+      const sz = H * 0.009 + rng() * H * 0.014;
       const g = [32 + rng()*30, 78 + rng()*62, 14 + rng()*28];
       leaves.push({ x: lx, y: ly, sz, angle: rng() * Math.PI * 2, color: rgb(g),
                     removed: false, claimedBy: null, id: leaves.length,
@@ -289,12 +303,78 @@ function genTree() {
   });
 }
 
+// ── ROOTS ────────────────────────────────────────────────────
+function genRoots() {
+  roots = [];
+  const tx = TX(), ty = TY();
+
+  function rootBranch(x, y, angle, len, depth) {
+    if (depth === 0 || len < H * 0.014) return;
+    const ex = x + Math.cos(angle) * len;
+    const ey = y - Math.sin(angle) * len; // negative sin → ey > y when angle near -PI/2
+    if (ey < ty - 6) return; // don't surface above ground
+    roots.push({ x1: x, y1: y, x2: ex, y2: ey, w: Math.max(0.8, len * 0.092), depth });
+    const spr = 0.20 + rng() * 0.30;
+    rootBranch(ex, ey, angle - spr, len * (0.60 + rng() * 0.12), depth - 1);
+    rootBranch(ex, ey, angle + spr, len * (0.56 + rng() * 0.12), depth - 1);
+  }
+
+  rootBranch(tx, ty, -Math.PI / 2 + 0.14, H * 0.20, 6);
+  rootBranch(tx, ty, -Math.PI / 2 - 0.22, H * 0.18, 6);
+  rootBranch(tx, ty, -Math.PI / 2 + 0.48, H * 0.16, 5);
+  rootBranch(tx, ty, -Math.PI / 2 - 0.54, H * 0.15, 5);
+  rootBranch(tx, ty, -Math.PI / 2 + 0.80, H * 0.12, 4);
+}
+
+function drawRoots() {
+  roots.forEach(r => {
+    const shade = r.depth >= 5 ? '#3a2008' : r.depth >= 3 ? '#4a2e14' : '#5a3a1c';
+    ctx.strokeStyle = shade; ctx.lineWidth = r.w; ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.moveTo(r.x1, r.y1); ctx.lineTo(r.x2, r.y2); ctx.stroke();
+    if (r.w > 3) {
+      ctx.strokeStyle = 'rgba(170,105,38,0.16)'; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(r.x1 - 1, r.y1); ctx.lineTo(r.x2 - 1, r.y2); ctx.stroke();
+    }
+  });
+}
+
 function drawTree() {
   branches.forEach(b => {
-    const shade = b.depth >= 7 ? '#3a2510' : b.depth >= 5 ? '#48321a' : '#5c4025';
-    ctx.strokeStyle = shade; ctx.lineWidth = b.w; ctx.lineCap = 'round';
+    const shade = b.depth >= 7 ? '#2e1a08' : b.depth >= 5 ? '#3d2412' : '#4e3218';
+    ctx.lineCap = 'round';
+    ctx.strokeStyle = shade; ctx.lineWidth = b.w;
     ctx.beginPath(); ctx.moveTo(b.x1, b.y1); ctx.lineTo(b.x2, b.y2); ctx.stroke();
-    if (b.w > 3) {
+
+    if (b.w > 7) {
+      // Bark texture: lit highlight + shadow edge + longitudinal furrows
+      const dx = b.x2 - b.x1, dy = b.y2 - b.y1;
+      const bLen = Math.hypot(dx, dy) || 1;
+      const nx = -dy / bLen, ny = dx / bLen; // perpendicular to branch
+      const off = b.w * 0.24;
+
+      ctx.strokeStyle = 'rgba(155,95,35,0.22)'; ctx.lineWidth = b.w * 0.30;
+      ctx.beginPath();
+      ctx.moveTo(b.x1 + nx * off, b.y1 + ny * off);
+      ctx.lineTo(b.x2 + nx * off, b.y2 + ny * off); ctx.stroke();
+
+      ctx.strokeStyle = 'rgba(0,0,0,0.20)'; ctx.lineWidth = b.w * 0.28;
+      ctx.beginPath();
+      ctx.moveTo(b.x1 - nx * off, b.y1 - ny * off);
+      ctx.lineTo(b.x2 - nx * off, b.y2 - ny * off); ctx.stroke();
+
+      ctx.lineWidth = 0.9;
+      for (let fi = 1; fi <= 2; fi++) {
+        const fo = fi * b.w * 0.13;
+        ctx.strokeStyle = 'rgba(0,0,0,0.11)';
+        ctx.beginPath();
+        ctx.moveTo(b.x1 - nx * fo, b.y1 - ny * fo);
+        ctx.lineTo(b.x2 - nx * fo, b.y2 - ny * fo); ctx.stroke();
+        ctx.strokeStyle = 'rgba(195,135,52,0.10)';
+        ctx.beginPath();
+        ctx.moveTo(b.x1 + nx * fo, b.y1 + ny * fo);
+        ctx.lineTo(b.x2 + nx * fo, b.y2 + ny * fo); ctx.stroke();
+      }
+    } else if (b.w > 3) {
       ctx.strokeStyle = 'rgba(210,160,80,0.07)'; ctx.lineWidth = 1;
       ctx.beginPath(); ctx.moveTo(b.x1 - 1, b.y1); ctx.lineTo(b.x2 - 1, b.y2); ctx.stroke();
     }
@@ -314,129 +394,133 @@ function drawTree() {
 const NX = () => W * 0.10;
 const NY = () => groundProfile(W * 0.10);
 
+let nestMound = { strokes: [], pebbles: [], eggs: [] };
+
+function genNest() {
+  nestMound = { strokes: [], pebbles: [], eggs: [] };
+  const entR = H * 0.040;
+
+  for (let i = 0; i < 22; i++) {
+    nestMound.strokes.push({
+      ox: (rng() - 0.5) * 140, oy: -32 - rng() * 65,
+      dx: rng() * 18 + 6, cv: (rng() - 0.5) * 8,
+      a: 0.05 + rng() * 0.09, w: rng() * 1.0 + 0.3
+    });
+  }
+  for (let i = 0; i < 14; i++) {
+    nestMound.pebbles.push({
+      ox: (rng() - 0.5) * 120, oy: -24 - rng() * 60,
+      r: rng() * 2.0 + 0.5
+    });
+  }
+
+  // Eggs inside arch — relative offsets from (nx, ny); oy negative = upward
+  const eggs = [];
+  let att = 0;
+  while (eggs.length < 38 && att < 400) {
+    const ox = (rng() - 0.5) * 2 * entR * 0.82;
+    const oy = -(rng() * entR * 0.84);
+    if (ox * ox + oy * oy <= entR * entR * 0.86) {
+      eggs.push({ ox, oy, rx: 1.3 + rng() * 1.0, ry: 2.0 + rng() * 1.3, ang: rng() * Math.PI });
+    }
+    att++;
+  }
+  eggs.sort((a, b) => b.oy - a.oy); // bottom (oy near 0) first
+  nestMound.eggs = eggs;
+}
+
 function drawNest() {
   const nx = NX(), ny = NY();
-  // Shadow
-  ctx.fillStyle = 'rgba(0,0,0,0.18)';
-  ctx.beginPath(); ctx.ellipse(nx + 7, ny + 7, 57, 13, 0, 0, Math.PI * 2); ctx.fill();
-  // Mound
-  const mg = ctx.createRadialGradient(nx, ny - 6, 2, nx, ny + 2, 54);
-  mg.addColorStop(0, '#6e3f1c'); mg.addColorStop(0.65, '#4e2c0c'); mg.addColorStop(1, '#381e08');
-  ctx.fillStyle = mg;
-  ctx.beginPath(); ctx.ellipse(nx, ny, 52, 19, 0, 0, Math.PI * 2); ctx.fill();
-  // Hole
-  ctx.fillStyle = '#0d0500';
-  ctx.beginPath(); ctx.ellipse(nx, ny + 5, 13, 7, 0, 0, Math.PI * 2); ctx.fill();
-  ctx.strokeStyle = '#3c1e08'; ctx.lineWidth = 2;
-  ctx.beginPath(); ctx.ellipse(nx, ny + 5, 13, 7, 0, 0, Math.PI * 2); ctx.stroke();
-}
+  const lw = W * 0.076, rw = W * 0.040, mH = H * 0.118;
+  const entR = H * 0.040;
 
-// ── UNDERGROUND COLONY ───────────────────────────────────────
-let colony = { segs: [], chambers: [], eggs: [] };
-
-function genUnderground() {
-  colony = { segs: [], chambers: [], eggs: [] };
-  // Depths below nest surface (in pixels)
-  const dA = H * 0.050;  // first junction
-  const dB = H * 0.085;  // second junction
-  const dC = H * 0.128;  // queen chamber
-  const tw = Math.max(7, H * 0.013); // tunnel half-width
-
-  // Entrance shaft + main spine
-  colony.segs.push({ x1:0, y1:6, x2:0, y2:dA });
-  colony.segs.push({ x1:0, y1:dA, x2:0, y2:dC });
-
-  // Left nursery gallery
-  const lx = -(W * 0.038 + rng() * W * 0.012);
-  const ly = dA + H * 0.022 + rng() * H * 0.01;
-  colony.segs.push({ x1:0, y1:dA * 0.65, x2:lx, y2:ly });
-  colony.chambers.push({ x:lx, y:ly, rx:W*0.022+rng()*W*0.008, ry:H*0.017+rng()*H*0.006, type:'nursery' });
-
-  // Right food-store gallery
-  const fx = W * 0.030 + rng() * W * 0.010;
-  const fy = dA * 0.45 + rng() * H * 0.012;
-  colony.segs.push({ x1:0, y1:dA * 0.35, x2:fx, y2:fy });
-  colony.chambers.push({ x:fx, y:fy, rx:W*0.016+rng()*W*0.006, ry:H*0.013+rng()*H*0.005, type:'food' });
-
-  // Junction chamber at dB
-  colony.chambers.push({ x:0, y:dB, rx:tw*1.6, ry:tw*1.1, type:'junction' });
-
-  // Small side-storage at dB
-  const sx = -(W * 0.026 + rng() * W * 0.009);
-  const sy = dB + H * 0.020 + rng() * H * 0.009;
-  colony.segs.push({ x1:0, y1:dB, x2:sx, y2:sy });
-  colony.chambers.push({ x:sx, y:sy, rx:tw*1.2, ry:tw*0.85, type:'storage' });
-
-  // Queen chamber
-  colony.chambers.push({ x:0, y:dC, rx:W*0.033+rng()*W*0.006, ry:H*0.024+rng()*H*0.008, type:'queen' });
-
-  // Eggs in nursery
-  const nur = colony.chambers.find(c => c.type === 'nursery');
-  for (let i = 0; i < 18 + Math.floor(rng() * 8); i++)
-    colony.eggs.push({ x: nur.x + (rng()-0.5)*nur.rx*1.5, y: nur.y + (rng()-0.5)*nur.ry*1.5,
-                       rx: 1.4+rng()*1.1, ry: 2.2+rng()*1.4, ang: rng()*Math.PI });
-
-  // Eggs in queen chamber
-  const qc = colony.chambers.find(c => c.type === 'queen');
-  for (let i = 0; i < 26 + Math.floor(rng() * 10); i++)
-    colony.eggs.push({ x: qc.x + (rng()-0.5)*qc.rx*1.5, y: qc.y + (rng()-0.5)*qc.ry*1.5,
-                       rx: 1.5+rng()*1.2, ry: 2.4+rng()*1.5, ang: rng()*Math.PI });
-}
-
-function drawNestUnderground() {
-  const nx = NX(), ny = NY();
-  const tw = Math.max(7, H * 0.013);
-
-  ctx.save();
-  // Clip to underground region below the nest surface
+  // Ground shadow
+  ctx.fillStyle = 'rgba(0,0,0,0.20)';
   ctx.beginPath();
-  ctx.rect(nx - W * 0.13, ny - 1, W * 0.26, H - ny + 1);
+  ctx.ellipse(nx + 6, ny + 7, (lw + rw) * 0.48, mH * 0.09, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  function moundPath() {
+    ctx.beginPath();
+    ctx.moveTo(nx - lw, ny);
+    ctx.bezierCurveTo(nx - lw, ny - mH * 0.62, nx - lw * 0.22, ny - mH, nx, ny - mH);
+    ctx.bezierCurveTo(nx + rw * 0.28, ny - mH, nx + rw, ny - mH * 0.62, nx + rw, ny);
+    ctx.closePath();
+  }
+
+  // Mound fill
+  const mg = ctx.createRadialGradient(nx - lw * 0.28, ny - mH * 0.68, mH * 0.05, nx, ny - mH * 0.22, (lw + rw) * 0.78);
+  mg.addColorStop(0,    '#d4a876');
+  mg.addColorStop(0.28, '#a06838');
+  mg.addColorStop(0.62, '#7a4c22');
+  mg.addColorStop(1,    '#4e2c0e');
+  ctx.fillStyle = mg;
+  moundPath();
+  ctx.fill();
+
+  // Surface texture clipped to mound
+  ctx.save();
+  moundPath();
   ctx.clip();
-
-  function tube(x1, y1, x2, y2) {
-    ctx.lineCap = 'round';
-    ctx.strokeStyle = '#100702'; ctx.lineWidth = tw * 2.2;
-    ctx.beginPath(); ctx.moveTo(nx+x1, ny+y1); ctx.lineTo(nx+x2, ny+y2); ctx.stroke();
-    ctx.strokeStyle = '#2a1308'; ctx.lineWidth = tw * 1.3;
-    ctx.beginPath(); ctx.moveTo(nx+x1, ny+y1); ctx.lineTo(nx+x2, ny+y2); ctx.stroke();
-  }
-
-  function chamber(c) {
-    ctx.fillStyle = '#0f0601';
-    ctx.beginPath(); ctx.ellipse(nx+c.x, ny+c.y, c.rx+3, c.ry+3, 0, 0, Math.PI*2); ctx.fill();
-    ctx.fillStyle = c.type === 'queen' ? '#1e0e05' : '#261208';
-    ctx.beginPath(); ctx.ellipse(nx+c.x, ny+c.y, c.rx, c.ry, 0, 0, Math.PI*2); ctx.fill();
-    if (c.type === 'queen') {
-      // Warm amber glow hinting at the queen's presence
-      const qg = ctx.createRadialGradient(nx+c.x, ny+c.y, 0, nx+c.x, ny+c.y, c.rx * 0.85);
-      qg.addColorStop(0, 'rgba(200,100,20,0.12)');
-      qg.addColorStop(1, 'rgba(200,100,20,0)');
-      ctx.fillStyle = qg;
-      ctx.beginPath(); ctx.ellipse(nx+c.x, ny+c.y, c.rx, c.ry, 0, 0, Math.PI*2); ctx.fill();
-      // Queen body — large oval with legs suggested
-      ctx.fillStyle = '#1a0c04';
-      ctx.beginPath(); ctx.ellipse(nx+c.x, ny+c.y+2, c.rx*0.38, c.ry*0.48, 0, 0, Math.PI*2); ctx.fill();
-      ctx.fillStyle = '#241008';
-      ctx.beginPath(); ctx.ellipse(nx+c.x+c.rx*0.08, ny+c.y, c.rx*0.18, c.ry*0.22, 0, 0, Math.PI*2); ctx.fill();
-    }
-    if (c.type === 'nursery') {
-      // Faint blue-white glow for larval chamber
-      ctx.fillStyle = 'rgba(200,220,255,0.04)';
-      ctx.beginPath(); ctx.ellipse(nx+c.x, ny+c.y, c.rx, c.ry, 0, 0, Math.PI*2); ctx.fill();
-    }
-  }
-
-  colony.segs.forEach(s => tube(s.x1, s.y1, s.x2, s.y2));
-  colony.chambers.forEach(chamber);
-
-  // Eggs — small cream ovals, count grows with the ant population
-  const visibleEggs = Math.min(ants.length, colony.eggs.length);
-  colony.eggs.slice(0, visibleEggs).forEach(e => {
-    ctx.fillStyle = 'rgba(242,236,205,0.82)';
-    ctx.beginPath(); ctx.ellipse(nx+e.x, ny+e.y, e.rx, e.ry, e.ang, 0, Math.PI*2); ctx.fill();
+  nestMound.strokes.forEach(s => {
+    ctx.strokeStyle = `rgba(58,22,4,${s.a})`;
+    ctx.lineWidth = s.w;
+    ctx.beginPath();
+    ctx.moveTo(nx + s.ox - s.dx, ny + s.oy);
+    ctx.quadraticCurveTo(nx + s.ox, ny + s.oy + s.cv, nx + s.ox + s.dx, ny + s.oy);
+    ctx.stroke();
   });
-
+  nestMound.pebbles.forEach(p => {
+    ctx.fillStyle = 'rgba(150,90,32,0.38)';
+    ctx.beginPath();
+    ctx.arc(nx + p.ox, ny + p.oy, p.r, 0, Math.PI * 2);
+    ctx.fill();
+  });
   ctx.restore();
+
+  function archPath() {
+    ctx.beginPath();
+    ctx.moveTo(nx - entR, ny);
+    ctx.arc(nx, ny, entR, Math.PI, 0, false); // upper arch (through top)
+    ctx.closePath();
+  }
+
+  // Dark entrance interior
+  archPath();
+  const ig = ctx.createRadialGradient(nx, ny - entR * 0.28, entR * 0.08, nx, ny - entR * 0.08, entR * 1.12);
+  ig.addColorStop(0,   '#341508');
+  ig.addColorStop(0.5, '#190802');
+  ig.addColorStop(1,   '#090301');
+  ctx.fillStyle = ig;
+  ctx.fill();
+
+  // Eggs clipped to arch — appear bottom-up as colony grows
+  ctx.save();
+  archPath();
+  ctx.clip();
+  const visEggs = Math.min(nestMound.eggs.length, Math.floor((ants.length / 40) * nestMound.eggs.length));
+  nestMound.eggs.slice(0, visEggs).forEach(e => {
+    ctx.fillStyle = 'rgba(242,236,205,0.90)';
+    ctx.beginPath();
+    ctx.ellipse(nx + e.ox, ny + e.oy, e.rx, e.ry, e.ang, 0, Math.PI * 2);
+    ctx.fill();
+  });
+  ctx.restore();
+
+  // Edge vignette inside arch
+  archPath();
+  const vg = ctx.createRadialGradient(nx, ny, entR * 0.62, nx, ny, entR * 1.06);
+  vg.addColorStop(0, 'rgba(0,0,0,0)');
+  vg.addColorStop(1, 'rgba(0,0,0,0.50)');
+  ctx.fillStyle = vg;
+  ctx.fill();
+
+  // Arch rim highlight
+  ctx.strokeStyle = 'rgba(195,132,55,0.58)';
+  ctx.lineWidth = 2.2;
+  ctx.beginPath();
+  ctx.arc(nx, ny, entR, Math.PI, 0, false);
+  ctx.stroke();
 }
 
 // ── POLE ─────────────────────────────────────────────────────
@@ -492,7 +576,7 @@ function ropeAt(frac, ts) {
 }
 
 function drawRope(ts) {
-  ctx.save(); ctx.strokeStyle = '#8a5e2c'; ctx.lineWidth = 2.2; ctx.lineCap = 'round';
+  ctx.save(); ctx.strokeStyle = '#8a5e2c'; ctx.lineWidth = 3.5; ctx.lineCap = 'round';
   ctx.beginPath();
   const p0 = ropeAt(0, ts); ctx.moveTo(p0.x, p0.y);
   for (let i = 1; i <= 80; i++) { const p = ropeAt(i / 80, ts); ctx.lineTo(p.x, p.y); }
@@ -510,11 +594,11 @@ function drawRope(ts) {
   // Rope wraps around trunk at attachment point
   const aX = TX();
   const aY = TY() - H * 0.032;
-  const tr = Math.max(8, H * 0.011); // scaled to trunk width (root branch w = H*0.24*0.088/2)
-  const wo = tr + 6;      // horizontal overhang beyond trunk edge
+  const tr = Math.max(12, H * 0.017); // scaled to trunk half-width (root branch w = H*0.32*0.105/2)
+  const wo = tr + 8;      // horizontal overhang beyond trunk edge
   const wh = tr * 0.90;   // arc height per wrap
   const ws = tr * 1.40;   // spacing between wrap rows
-  ctx.strokeStyle = '#8a5e2c'; ctx.lineWidth = 2.2; ctx.lineCap = 'round';
+  ctx.strokeStyle = '#8a5e2c'; ctx.lineWidth = 3.5; ctx.lineCap = 'round';
 
   // Wrap 1 front
   ctx.beginPath();
@@ -933,7 +1017,7 @@ function initSim() {
   ants = []; particles = []; birds = [];
   birdTimer = 8; gFrame = 0;
   simDone = false; fadeOverlay = 0; fadeStarted = false;
-  genStars(); genGround(); genTree(); genUnderground();
+  genStars(); genGround(); genTree(); genRoots(); genNest();
   updateGrain();
 }
 
@@ -949,15 +1033,22 @@ let prevTS = 0;
 function loop(ts) {
   if (!prevTS) prevTS = ts;
   const realDt = Math.min((ts - prevTS) / 1000, 0.05);
-  const dt = realDt * speedMult;
   prevTS = ts;
+
+  if (paused) {
+    ui.textContent = `${fmtTime()}  ·  ${demoMode ? 'demo' : 'art'}  ·  ×${speedMult}  ·  D / S / P  ·  paused`;
+    requestAnimationFrame(loop);
+    return;
+  }
+
+  const dt = realDt * speedMult;
   simElapsed += dt * 1000;
   tickTime();
 
   ctx.clearRect(0, 0, W, H);
   drawSky(ts);
   drawGround(ts);
-  drawNestUnderground();
+  drawRoots();
   drawNest();
   drawPole();
   drawTree();
@@ -982,7 +1073,7 @@ function loop(ts) {
     }
   }
 
-  ui.textContent = `${fmtTime()}  ·  ${demoMode ? 'demo' : 'art'}  ·  ×${speedMult}  ·  D / S`;
+  ui.textContent = `${fmtTime()}  ·  ${demoMode ? 'demo' : 'art'}  ·  ×${speedMult}  ·  D / S / P`;
   requestAnimationFrame(loop);
 }
 
